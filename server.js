@@ -1,12 +1,12 @@
-// Elegans - Video Sync WebSocket Server
-// Glitch.com'a yükleyin
+// Elegans Sync Server
+// by snlmbe
 
 const WebSocket = require('ws');
 const http = require('http');
 
 const server = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/html' });
-  res.end('<h1>Elegans Sync Server Running!</h1><p>WebSocket baglantisi icin wss:// kullanin</p>');
+  res.end('<h1>Elegans Sync Server</h1><p>WebSocket: wss://</p>');
 });
 
 const wss = new WebSocket.Server({ server });
@@ -14,25 +14,23 @@ const wss = new WebSocket.Server({ server });
 const rooms = new Map();
 const users = new Map();
 
-function generateRoomId() {
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-  let result = '';
-  for (let i = 0; i < 6; i++) {
-    result += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return result;
+function genId() {
+  const c = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  let r = '';
+  for (let i = 0; i < 6; i++) r += c[Math.floor(Math.random() * c.length)];
+  return r;
 }
 
 function getTime() {
-  const now = new Date();
-  return `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
+  const d = new Date();
+  return `${d.getHours().toString().padStart(2,'0')}:${d.getMinutes().toString().padStart(2,'0')}`;
 }
 
-function broadcast(roomId, msg, excludeWs = null) {
+function broadcast(roomId, msg, exclude = null) {
   const room = rooms.get(roomId);
   if (!room) return;
   room.members.forEach(m => {
-    if (m.ws !== excludeWs && m.ws.readyState === WebSocket.OPEN) {
+    if (m.ws !== exclude && m.ws.readyState === WebSocket.OPEN) {
       m.ws.send(JSON.stringify(msg));
     }
   });
@@ -61,13 +59,13 @@ wss.on('connection', (ws) => {
           break;
 
         case 'createRoom': {
-          const roomId = generateRoomId();
+          const roomId = genId();
           rooms.set(roomId, {
             id: roomId,
             name: msg.roomName,
-            password: msg.password || null,
             members: [{ ws, username: msg.username, isHost: true, hasAd: false }],
-            videoState: { currentTime: 0, playing: false }
+            sharedVideo: null,
+            videoState: { time: 0, playing: false }
           });
           const user = users.get(ws);
           if (user) user.roomId = roomId;
@@ -83,23 +81,22 @@ wss.on('connection', (ws) => {
         case 'joinRoom': {
           const room = rooms.get(msg.roomId);
           if (!room) {
-            ws.send(JSON.stringify({ type: 'error', message: 'Oda bulunamadi' }));
-            break;
-          }
-          if (room.password && room.password !== msg.password) {
-            ws.send(JSON.stringify({ type: 'error', message: 'Yanlis sifre' }));
+            ws.send(JSON.stringify({ type: 'error', message: 'Oda bulunamadı' }));
             break;
           }
           room.members.push({ ws, username: msg.username, isHost: false, hasAd: false });
           const user = users.get(ws);
           if (user) user.roomId = msg.roomId;
+          
           ws.send(JSON.stringify({
             type: 'roomJoined',
             roomId: msg.roomId,
             roomName: room.name,
             members: getMembers(msg.roomId),
+            sharedVideo: room.sharedVideo,
             isHost: false
           }));
+          
           broadcast(msg.roomId, {
             type: 'memberJoined',
             username: msg.username,
@@ -108,15 +105,44 @@ wss.on('connection', (ws) => {
           break;
         }
 
+        case 'rejoin': {
+          const room = rooms.get(msg.roomId);
+          if (!room) {
+            ws.send(JSON.stringify({ type: 'error', message: 'Oda artık yok' }));
+            break;
+          }
+          // Remove old connection
+          const idx = room.members.findIndex(m => m.username === msg.username);
+          if (idx !== -1) room.members.splice(idx, 1);
+          
+          room.members.push({ ws, username: msg.username, isHost: room.members.length === 0, hasAd: false });
+          const user = users.get(ws);
+          if (user) user.roomId = msg.roomId;
+          
+          ws.send(JSON.stringify({
+            type: 'roomJoined',
+            roomId: msg.roomId,
+            roomName: room.name,
+            members: getMembers(msg.roomId),
+            sharedVideo: room.sharedVideo,
+            isHost: room.members.length === 1
+          }));
+          break;
+        }
+
         case 'leaveRoom': {
           const room = rooms.get(msg.roomId);
           if (!room) break;
+          
           const idx = room.members.findIndex(m => m.ws === ws);
           if (idx === -1) break;
+          
           const wasHost = room.members[idx].isHost;
           room.members.splice(idx, 1);
+          
           const user = users.get(ws);
           if (user) user.roomId = null;
+          
           if (room.members.length === 0) {
             rooms.delete(msg.roomId);
           } else {
@@ -130,11 +156,32 @@ wss.on('connection', (ws) => {
           break;
         }
 
+        case 'shareVideo': {
+          const room = rooms.get(msg.roomId);
+          if (!room) break;
+          
+          room.sharedVideo = msg.video;
+          
+          // Broadcast to all including sender
+          room.members.forEach(m => {
+            if (m.ws.readyState === WebSocket.OPEN) {
+              m.ws.send(JSON.stringify({
+                type: 'videoShared',
+                username: msg.username,
+                video: msg.video
+              }));
+            }
+          });
+          break;
+        }
+
         case 'videoSync': {
           const room = rooms.get(msg.roomId);
           if (!room) break;
-          room.videoState.currentTime = msg.time;
+          
+          room.videoState.time = msg.time;
           room.videoState.playing = msg.action === 'play';
+          
           broadcast(msg.roomId, {
             type: 'videoSync',
             action: msg.action,
@@ -147,13 +194,15 @@ wss.on('connection', (ws) => {
         case 'adDetected': {
           const room = rooms.get(msg.roomId);
           if (!room) break;
+          
           const member = room.members.find(m => m.username === msg.username);
           if (member) member.hasAd = true;
+          
           broadcast(msg.roomId, { type: 'adDetected', username: msg.username });
           broadcast(msg.roomId, {
             type: 'videoSync',
             action: 'pause',
-            time: room.videoState.currentTime,
+            time: room.videoState.time,
             username: 'Sistem'
           });
           break;
@@ -162,8 +211,10 @@ wss.on('connection', (ws) => {
         case 'adEnded': {
           const room = rooms.get(msg.roomId);
           if (!room) break;
+          
           const member = room.members.find(m => m.username === msg.username);
           if (member) member.hasAd = false;
+          
           const anyAd = room.members.some(m => m.hasAd);
           if (!anyAd) {
             broadcast(msg.roomId, { type: 'adEnded', username: msg.username });
@@ -171,7 +222,7 @@ wss.on('connection', (ws) => {
               broadcast(msg.roomId, {
                 type: 'videoSync',
                 action: 'play',
-                time: room.videoState.currentTime,
+                time: room.videoState.time,
                 username: 'Sistem'
               });
             }, 1000);
@@ -182,6 +233,7 @@ wss.on('connection', (ws) => {
         case 'chatMessage': {
           const room = rooms.get(msg.roomId);
           if (!room) break;
+          
           room.members.forEach(m => {
             if (m.ws.readyState === WebSocket.OPEN) {
               m.ws.send(JSON.stringify({
@@ -194,19 +246,6 @@ wss.on('connection', (ws) => {
           });
           break;
         }
-
-        case 'videoInfo': {
-          const room = rooms.get(msg.roomId);
-          if (!room) break;
-          broadcast(msg.roomId, {
-            type: 'videoInfo',
-            title: msg.title,
-            currentTime: msg.currentTime,
-            duration: msg.duration,
-            playing: msg.playing
-          });
-          break;
-        }
       }
     } catch (e) {
       console.error('Error:', e);
@@ -215,7 +254,7 @@ wss.on('connection', (ws) => {
 
   ws.on('close', () => {
     const user = users.get(ws);
-    if (user && user.roomId) {
+    if (user?.roomId) {
       const room = rooms.get(user.roomId);
       if (room) {
         const idx = room.members.findIndex(m => m.ws === ws);
@@ -223,6 +262,7 @@ wss.on('connection', (ws) => {
           const username = room.members[idx].username;
           const wasHost = room.members[idx].isHost;
           room.members.splice(idx, 1);
+          
           if (room.members.length === 0) {
             rooms.delete(user.roomId);
           } else {
@@ -242,6 +282,4 @@ wss.on('connection', (ws) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`Elegans Server running on port ${PORT}`);
-});
+server.listen(PORT, () => console.log(`Server running on ${PORT}`));
